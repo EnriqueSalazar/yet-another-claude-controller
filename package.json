@@ -1,0 +1,34 @@
+{
+  "name": "yacc",
+  "version": "2.0.0",
+  "description": "YACC — Yet Another Claude Controller. Control Claude Code terminal sessions from Discord.",
+  "main": "start-discord-bot.js",
+  "scripts": {
+    "start": "node start-discord-bot.js"
+  },
+  "keywords": [
+    "claude-code",
+    "discord",
+    "remote",
+    "terminal",
+    "hooks",
+    "yacc"
+  ],
+  "author": "Enrique Salazar",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/EnriqueSalazar/yet-another-claude-controller.git"
+  },
+  "homepage": "https://github.com/EnriqueSalazar/yet-another-claude-controller#readme",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "os": [
+    "darwin"
+  ],
+  "dependencies": {
+    "discord.js": "^14.25.1",
+    "dotenv": "^17.2.1"
+  }
+}
