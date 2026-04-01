@@ -253,57 +253,126 @@ async function ensureChannel(guild, projectName, tty) {
     return channel;
 }
 
-// ── Message handler ──────────────────────────────────────
+// ── Message processing ───────────────────────────────────
+// Shared logic used by both gateway events and REST poller
+
+const processedMessages = new Set(); // message IDs already handled
+
+async function processUserMessage(message) {
+    // Dedup — prevent double-processing from gateway + poller
+    if (processedMessages.has(message.id)) return;
+    processedMessages.add(message.id);
+    // Prune old IDs (keep last 500)
+    if (processedMessages.size > 500) {
+        const arr = [...processedMessages];
+        for (let i = 0; i < arr.length - 500; i++) processedMessages.delete(arr[i]);
+    }
+
+    const mapping = channelIndex.get(message.channel.id);
+    if (!mapping) return;
+
+    if (!mapping.tty) {
+        await message.reply('No active terminal session for this channel.').catch(() => {});
+        return;
+    }
+
+    if (!checkAndRecordCommand(message.channel.id)) return;
+
+    const images = message.attachments.filter(a => {
+        const ext = path.extname(a.name || '').toLowerCase();
+        return ALLOWED_IMAGE_EXTS.has(ext) || (a.contentType && a.contentType.startsWith('image/'));
+    });
+
+    let commandText = message.content || '';
+
+    if (images.size > 0) {
+        try {
+            const paths = await Promise.all(
+                [...images.values()].map(a => downloadDiscordAttachment(a.url, a.name))
+            );
+            commandText = `${commandText || 'Look at these images'} ${paths.join(' ')}`.trim();
+        } catch (e) {
+            logger.error('Image download failed:', e.message);
+            await message.reply('Failed to download image.').catch(() => {});
+            return;
+        }
+    }
+
+    if (!commandText) return;
+
+    try {
+        await injectToTTY(commandText, mapping.tty);
+        await message.react('✅').catch(() => {});
+        logger.info(`Injected — ${mapping.project} (${path.basename(mapping.tty)})`);
+    } catch (e) {
+        logger.error('Injection failed:', e.message);
+        await message.react('❌').catch(() => {});
+    }
+}
+
+// ── Gateway message handler ──────────────────────────────
 
 client.on('messageCreate', async (message) => {
     try {
         if (message.author.bot) return;
         if (!message.guild || message.guild.id !== config.guildId) return;
         if (!isAuthorizedUser(message.author.id)) return;
-
-        const mapping = channelIndex.get(message.channel.id);
-        if (!mapping) return;
-
-        if (!mapping.tty) {
-            await message.reply('No active terminal session for this channel.').catch(() => {});
-            return;
-        }
-
-        if (!checkAndRecordCommand(message.channel.id)) {
-            await message.reply('Too fast — wait a moment.').catch(() => {});
-            return;
-        }
-
-        const images = message.attachments.filter(a => {
-            const ext = path.extname(a.name || '').toLowerCase();
-            return ALLOWED_IMAGE_EXTS.has(ext) || (a.contentType && a.contentType.startsWith('image/'));
-        });
-
-        let commandText = message.content || '';
-
-        if (images.size > 0) {
-            try {
-                const paths = await Promise.all(
-                    [...images.values()].map(a => downloadDiscordAttachment(a.url, a.name))
-                );
-                commandText = `${commandText || 'Look at these images'} ${paths.join(' ')}`.trim();
-            } catch (e) {
-                logger.error('Image download failed:', e.message);
-                await message.reply('Failed to download image.').catch(() => {});
-                return;
-            }
-        }
-
-        if (!commandText) return;
-
-        await injectToTTY(commandText, mapping.tty);
-        await message.react('✅').catch(() => {});
-        logger.info(`Injected — ${mapping.project} (${path.basename(mapping.tty)})`);
+        await processUserMessage(message);
     } catch (e) {
-        logger.error('Message handler error:', e.message);
-        await message.react('❌').catch(() => {});
+        logger.error('Gateway handler error:', e.message);
     }
 });
+
+// ── REST message poller (backup) ─────────────────────────
+// Polls session channels via REST API to catch messages the gateway missed
+
+const lastPolledMessage = new Map(); // channelId → last message ID
+
+async function pollChannelMessages() {
+    for (const [project, info] of Object.entries(channelMap)) {
+        if (!info.channelId || !info.tty) continue;
+        try {
+            const channel = client.channels.cache.get(info.channelId);
+            if (!channel) continue;
+
+            const after = lastPolledMessage.get(info.channelId) || '0';
+            const messages = await channel.messages.fetch({ limit: 10, after }).catch(() => null);
+            if (!messages || messages.size === 0) continue;
+
+            // Update last polled to newest
+            const newest = messages.first();
+            lastPolledMessage.set(info.channelId, newest.id);
+
+            // Process unhandled messages (oldest first)
+            const sorted = [...messages.values()].reverse();
+            for (const msg of sorted) {
+                if (msg.author.bot) continue;
+                if (!isAuthorizedUser(msg.author.id)) continue;
+                if (processedMessages.has(msg.id)) continue;
+                logger.info(`Poller caught missed message in #${channel.name}: ${(msg.content || '').substring(0, 50)}`);
+                await processUserMessage(msg);
+            }
+        } catch (e) {
+            logger.debug(`Poll error for ${project}: ${e.message}`);
+        }
+    }
+}
+
+// Initialize poller with current latest messages so it doesn't replay history
+async function initPoller() {
+    for (const [project, info] of Object.entries(channelMap)) {
+        if (!info.channelId) continue;
+        try {
+            const channel = client.channels.cache.get(info.channelId);
+            if (!channel) continue;
+            const messages = await channel.messages.fetch({ limit: 1 }).catch(() => null);
+            if (messages && messages.size > 0) {
+                lastPolledMessage.set(info.channelId, messages.first().id);
+            }
+        } catch (_) {}
+    }
+    logger.info(`Poller initialized for ${lastPolledMessage.size} channels`);
+}
 
 // ── Notification processing ──────────────────────────────
 
@@ -394,10 +463,12 @@ client.once('ready', async () => {
     loadChannelMap();
     cleanExpiredSessions();
     cleanOldImages();
+    await initPoller();
     setInterval(cleanExpiredSessions, 60 * 60 * 1000);
     setInterval(cleanOldImages, 60 * 60 * 1000);
     setInterval(pruneRateLimits, 60 * 1000);
     setInterval(processNotifications, 2000);
+    setInterval(pollChannelMessages, 5000); // REST backup every 5s
 });
 
 // ── Connection health ────────────────────────────────────
