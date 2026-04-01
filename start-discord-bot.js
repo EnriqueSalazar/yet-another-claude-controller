@@ -379,7 +379,32 @@ client.on('messageCreate', async (message) => {
             return;
         }
 
-        const mapping = channelIndex.get(message.channel.id);
+        let mapping = channelIndex.get(message.channel.id);
+
+        // If unmapped but in the Claude Sessions category, auto-recover
+        // by matching channel name to a running Claude process
+        if (!mapping && message.channel.parentId === categoryId) {
+            const channelName = message.channel.name;
+            // Try both hyphenated and underscored versions
+            const variants = [channelName, channelName.replace(/-/g, '_')];
+            for (const name of variants) {
+                const tty = findActiveTTYForProject(name);
+                const cwd = findProjectCwd(name);
+                if (tty || cwd) {
+                    channelMap[name] = {
+                        channelId: message.channel.id,
+                        tty: tty || null,
+                        lastSeen: Date.now()
+                    };
+                    rebuildChannelIndex();
+                    markChannelMapDirty();
+                    mapping = channelIndex.get(message.channel.id);
+                    logger.info(`Auto-recovered: #${channelName} → ${name} (${tty || 'CLI mode'})`);
+                    break;
+                }
+            }
+        }
+
         if (!mapping) return;
 
         if (!mapping.tty) {
@@ -591,30 +616,34 @@ client.on('warn', (msg) => logger.warn('Client warning:', msg));
 client.on('shardDisconnect', (e, id) => logger.warn(`Shard ${id} disconnected (code ${e.code})`));
 client.on('shardReconnecting', (id) => logger.info(`Shard ${id} reconnecting...`));
 client.on('shardResume', async (id) => {
-    logger.info(`Shard ${id} resumed`);
+    logger.info(`Shard ${id} resumed — will force full reconnect`);
+    needsFullReconnect = true;
     try {
         await client.guilds.fetch(config.guildId);
-        logger.info('Guild cache refreshed');
     } catch (_) {}
 });
 client.on('shardError', (e, id) => logger.error(`Shard ${id} error:`, e.message));
 
-// Watchdog: only restart if WebSocket status is not READY or ping is -1 (dead)
+// Watchdog: force full reconnect after every shard resume
+// discord.js shard resume often breaks messageCreate delivery
 let watchdogRestarts = 0;
+let needsFullReconnect = false;
+
 
 async function watchdog() {
     const ws = client.ws;
 
-    // Check: WebSocket status is not READY (0)
     if (ws.status !== 0) {
         logger.error(`WebSocket unhealthy (status: ${ws.status}). Force reconnect...`);
         await forceReconnect();
         return;
     }
 
-    // Check: ping is -1 (no heartbeat ack received)
-    if (ws.ping === -1) {
-        logger.warn('No heartbeat ack — connection may be stale');
+    if (needsFullReconnect) {
+        needsFullReconnect = false;
+        logger.info('Executing scheduled full reconnect...');
+        await forceReconnect();
+        return;
     }
 }
 
