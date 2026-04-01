@@ -160,6 +160,51 @@ function pruneRateLimits() {
     }
 }
 
+// ── TTY health check ─────────────────────────────────────
+// Verify a TTY is alive and find the correct one for a project if stale
+
+function findActiveTTYForProject(projectName) {
+    // Check all running Claude processes and match by cwd
+    try {
+        const { execFileSync } = require('child_process');
+        const psOutput = execFileSync('ps', ['-eo', 'pid,tty,comm'], {
+            encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore']
+        });
+        const claudeProcs = psOutput.split('\n')
+            .filter(l => l.includes('claude') && l.includes('ttys'))
+            .map(l => {
+                const parts = l.trim().split(/\s+/);
+                return { pid: parts[0], tty: '/dev/' + parts[1] };
+            });
+
+        for (const proc of claudeProcs) {
+            try {
+                const lsof = execFileSync('lsof', ['-p', proc.pid, '-Fn'], {
+                    encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore']
+                });
+                const cwdMatch = lsof.match(/n(\/[^\n]+)/m);
+                if (cwdMatch && path.basename(cwdMatch[1]) === projectName) {
+                    return proc.tty;
+                }
+            } catch (_) {}
+        }
+    } catch (_) {}
+    return null;
+}
+
+function isTTYAlive(ttyPath) {
+    try {
+        const { execFileSync } = require('child_process');
+        const ttyName = path.basename(ttyPath);
+        const psOutput = execFileSync('ps', ['-eo', 'tty,comm'], {
+            encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore']
+        });
+        return psOutput.includes(ttyName) && psOutput.includes('claude');
+    } catch (_) {
+        return false;
+    }
+}
+
 // ── iTerm2 injection ─────────────────────────────────────
 // Uses iTerm2's native `write text` — no clipboard, no keystroke simulation.
 
@@ -301,6 +346,22 @@ client.on('messageCreate', async (message) => {
         if (!mapping.tty) {
             await message.reply('No active terminal session for this channel.').catch(() => {});
             return;
+        }
+
+        // Verify TTY is still alive — if not, try to find the new one
+        if (!isTTYAlive(mapping.tty)) {
+            logger.warn(`TTY ${mapping.tty} is dead for ${mapping.project}. Searching...`);
+            const newTTY = findActiveTTYForProject(mapping.project);
+            if (newTTY) {
+                channelMap[mapping.project].tty = newTTY;
+                mapping.tty = newTTY;
+                rebuildChannelIndex();
+                markChannelMapDirty();
+                logger.info(`Remapped ${mapping.project} → ${newTTY}`);
+            } else {
+                await message.reply('Terminal session not found. It may have restarted.').catch(() => {});
+                return;
+            }
         }
 
         if (!checkAndRecordCommand(message.channel.id)) {
