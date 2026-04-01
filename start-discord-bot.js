@@ -164,7 +164,6 @@ function pruneRateLimits() {
 // Verify a TTY is alive and find the correct one for a project if stale
 
 function findActiveTTYForProject(projectName) {
-    // Check all running Claude processes and match by cwd
     try {
         const { execFileSync } = require('child_process');
         const psOutput = execFileSync('ps', ['-eo', 'pid,tty,comm'], {
@@ -179,12 +178,16 @@ function findActiveTTYForProject(projectName) {
 
         for (const proc of claudeProcs) {
             try {
-                const lsof = execFileSync('lsof', ['-p', proc.pid, '-Fn'], {
+                // Use lsof with grep cwd to get the actual working directory
+                const lsof = execFileSync('lsof', ['-p', proc.pid], {
                     encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore']
                 });
-                const cwdMatch = lsof.match(/n(\/[^\n]+)/m);
-                if (cwdMatch && path.basename(cwdMatch[1]) === projectName) {
-                    return proc.tty;
+                const cwdLine = lsof.split('\n').find(l => l.includes(' cwd '));
+                if (cwdLine) {
+                    const cwd = cwdLine.trim().split(/\s+/).pop();
+                    if (path.basename(cwd) === projectName) {
+                        return proc.tty;
+                    }
                 }
             } catch (_) {}
         }
@@ -217,12 +220,15 @@ function findProjectCwd(projectName) {
 
         for (const proc of claudeProcs) {
             try {
-                const lsof = execFileSync('lsof', ['-p', proc.pid, '-Fn'], {
+                const lsof = execFileSync('lsof', ['-p', proc.pid], {
                     encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore']
                 });
-                const cwdMatch = lsof.match(/n(\/[^\n]+)/m);
-                if (cwdMatch && path.basename(cwdMatch[1]) === projectName) {
-                    return cwdMatch[1];
+                const cwdLine = lsof.split('\n').find(l => l.includes(' cwd '));
+                if (cwdLine) {
+                    const cwd = cwdLine.trim().split(/\s+/).pop();
+                    if (path.basename(cwd) === projectName) {
+                        return cwd;
+                    }
                 }
             } catch (_) {}
         }
