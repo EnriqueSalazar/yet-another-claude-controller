@@ -149,9 +149,10 @@ No session switching needed — each project has its own channel.
 
 ## Limitations
 
-- **macOS only** — relies on AppleScript and Terminal.app
-- **Foreground paste** — injecting a command briefly brings the target Terminal tab to focus
+- **macOS + iTerm2 only** — uses iTerm2's AppleScript `write text` for command injection
+- **Permission prompts can't be answered from Discord** — Claude Code's TUI dialogs ("Do you want to proceed?") use a special input mode that doesn't accept pasted text. Answer them from the terminal. The notification in Discord shows you the prompt so you know when to check.
 - **Discord message limit** — responses truncated to 4000 chars
+- **VS Code terminal not supported** — Claude Code in VS Code uses a custom input pipeline. Run Claude in iTerm2 tabs for Discord control.
 
 ## Origin
 

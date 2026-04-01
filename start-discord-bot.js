@@ -2,7 +2,7 @@
 
 /**
  * YACC — Yet Another Claude Controller
- * Discord bot — one channel per terminal session.
+ * Discord bot — one channel per iTerm2 terminal session.
  * No public URL needed. Single-user, private server.
  */
 
@@ -42,7 +42,6 @@ const RATE_LIMIT_MS = 2000;
 const MAX_IMAGE_SIZE = 25 * 1024 * 1024;
 const lastCommandTime = new Map();
 
-// Ensure directories
 for (const dir of [IMAGES_DIR, sessionsDir, path.dirname(CHANNEL_MAP_PATH), NOTIFY_DIR]) {
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
 }
@@ -59,15 +58,10 @@ function isAuthorizedUser(userId) {
 // ── Channel Map ──────────────────────────────────────────
 
 let channelMap = {};
-// Reverse index: channelId → { project, tty, ... }
 const channelIndex = new Map();
 
 function loadChannelMap() {
-    try {
-        channelMap = JSON.parse(fs.readFileSync(CHANNEL_MAP_PATH, 'utf8'));
-    } catch (_) {
-        channelMap = {};
-    }
+    try { channelMap = JSON.parse(fs.readFileSync(CHANNEL_MAP_PATH, 'utf8')); } catch (_) { channelMap = {}; }
     rebuildChannelIndex();
 }
 
@@ -79,12 +73,10 @@ function rebuildChannelIndex() {
 }
 
 let channelMapDirty = false;
-
 function saveChannelMap() {
     fs.writeFileSync(CHANNEL_MAP_PATH, JSON.stringify(channelMap, null, 2), { mode: 0o600 });
     channelMapDirty = false;
 }
-
 function markChannelMapDirty() {
     if (!channelMapDirty) {
         channelMapDirty = true;
@@ -92,27 +84,7 @@ function markChannelMapDirty() {
     }
 }
 
-// ── Session files ────────────────────────────────────────
-
-function getAllSessions() {
-    const now = Math.floor(Date.now() / 1000);
-    const sessions = [];
-    try {
-        for (const file of fs.readdirSync(sessionsDir)) {
-            if (!file.endsWith('.json')) continue;
-            try {
-                const s = JSON.parse(fs.readFileSync(path.join(sessionsDir, file), 'utf8'));
-                if (s.claudeTTY && typeof s.expiresAt === 'number' && s.expiresAt > now) sessions.push(s);
-            } catch (e) { logger.debug(`Bad session file ${file}: ${e.message}`); }
-        }
-    } catch (_) {}
-    const byTTY = new Map();
-    for (const s of sessions) {
-        const existing = byTTY.get(s.claudeTTY);
-        if (!existing || s.createdAt > existing.createdAt) byTTY.set(s.claudeTTY, s);
-    }
-    return Array.from(byTTY.values());
-}
+// ── Cleanup ──────────────────────────────────────────────
 
 function cleanExpiredSessions() {
     const now = Math.floor(Date.now() / 1000);
@@ -123,7 +95,7 @@ function cleanExpiredSessions() {
                 const fp = path.join(sessionsDir, file);
                 const s = JSON.parse(fs.readFileSync(fp, 'utf8'));
                 if (s.expiresAt && s.expiresAt < now) fs.unlinkSync(fp);
-            } catch (e) { logger.debug(`Cleanup error ${file}: ${e.message}`); }
+            } catch (_) {}
         }
     } catch (_) {}
 }
@@ -153,112 +125,21 @@ function pruneRateLimits() {
     for (const [key, time] of lastCommandTime) {
         if (time < cutoff) lastCommandTime.delete(key);
     }
-    // Also prune notification dedup map
     const notifCutoff = Date.now() - 60000;
     for (const [key, val] of lastNotification) {
         if (val.time < notifCutoff) lastNotification.delete(key);
     }
 }
 
-// ── TTY health check ─────────────────────────────────────
-// Verify a TTY is alive and find the correct one for a project if stale
-
-function findActiveTTYForProject(projectName) {
-    try {
-        const { execFileSync } = require('child_process');
-        const psOutput = execFileSync('ps', ['-eo', 'pid,tty,comm'], {
-            encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore']
-        });
-        const claudeProcs = psOutput.split('\n')
-            .filter(l => l.includes('claude') && l.includes('ttys'))
-            .map(l => {
-                const parts = l.trim().split(/\s+/);
-                return { pid: parts[0], tty: '/dev/' + parts[1] };
-            });
-
-        for (const proc of claudeProcs) {
-            try {
-                // Use lsof with grep cwd to get the actual working directory
-                const lsof = execFileSync('lsof', ['-p', proc.pid], {
-                    encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore']
-                });
-                const cwdLine = lsof.split('\n').find(l => l.includes(' cwd '));
-                if (cwdLine) {
-                    const cwd = cwdLine.trim().split(/\s+/).pop();
-                    if (path.basename(cwd) === projectName) {
-                        return proc.tty;
-                    }
-                }
-            } catch (_) {}
-        }
-    } catch (_) {}
-    return null;
-}
-
-function isTTYAliveForProject(ttyPath, projectName) {
-    try {
-        const { execFileSync } = require('child_process');
-        const ttyName = path.basename(ttyPath);
-        const psOutput = execFileSync('ps', ['-eo', 'pid,tty,comm'], {
-            encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore']
-        });
-        // Find Claude process on this TTY
-        const proc = psOutput.split('\n').find(l => l.includes(ttyName) && l.includes('claude'));
-        if (!proc) return false;
-        // Verify this process's cwd matches the project
-        const pid = proc.trim().split(/\s+/)[0];
-        const lsof = execFileSync('lsof', ['-p', pid], {
-            encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore']
-        });
-        const cwdLine = lsof.split('\n').find(l => l.includes(' cwd '));
-        if (!cwdLine) return false;
-        const cwd = cwdLine.trim().split(/\s+/).pop();
-        return path.basename(cwd) === projectName;
-    } catch (_) {
-        return false;
-    }
-}
-
-function findProjectCwd(projectName) {
-    try {
-        const { execFileSync } = require('child_process');
-        const psOutput = execFileSync('ps', ['-eo', 'pid,tty,comm'], {
-            encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore']
-        });
-        const claudeProcs = psOutput.split('\n')
-            .filter(l => l.includes('claude') && l.includes('ttys'))
-            .map(l => { const p = l.trim().split(/\s+/); return { pid: p[0] }; });
-
-        for (const proc of claudeProcs) {
-            try {
-                const lsof = execFileSync('lsof', ['-p', proc.pid], {
-                    encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore']
-                });
-                const cwdLine = lsof.split('\n').find(l => l.includes(' cwd '));
-                if (cwdLine) {
-                    const cwd = cwdLine.trim().split(/\s+/).pop();
-                    if (path.basename(cwd) === projectName) {
-                        return cwd;
-                    }
-                }
-            } catch (_) {}
-        }
-    } catch (_) {}
-    return null;
-}
-
 // ── iTerm2 injection ─────────────────────────────────────
-// Uses iTerm2's native `write text` — no clipboard, no keystroke simulation.
 
 function injectToTTY(command, ttyPath) {
     return new Promise((resolve, reject) => {
         const ttyName = path.basename(ttyPath);
         if (!TTY_PATTERN.test(ttyName)) { reject(new Error('Invalid TTY')); return; }
 
-        // Escape backslashes and double quotes for AppleScript string
         const escaped = command.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
 
-        // Try iTerm2 native write first
         const script = [
             'tell application "iTerm2"',
             '    repeat with w in windows',
@@ -266,7 +147,7 @@ function injectToTTY(command, ttyPath) {
             '            repeat with s in sessions of t',
             `                if tty of s contains "${ttyName}" then`,
             `                    tell s to write text "${escaped}"`,
-            '                    return "iterm2"',
+            '                    return "ok"',
             '                end if',
             '            end repeat',
             '        end repeat',
@@ -276,16 +157,12 @@ function injectToTTY(command, ttyPath) {
         ].join('\n');
 
         execFile('osascript', ['-e', script], (error, stdout) => {
-            const result = error ? 'tty_not_found' : stdout.trim();
-
-            if (result !== 'tty_not_found') {
-                resolve(result);
+            if (error) { reject(new Error('AppleScript failed')); return; }
+            if (stdout.trim() === 'tty_not_found') {
+                reject(new Error('Session not found in iTerm2. Run Claude in an iTerm2 tab.'));
                 return;
             }
-
-            // Fallback: TTY not in iTerm2 (VS Code, Terminal.app, etc.)
-            // Cannot inject directly — reject so caller can use claude --resume instead
-            reject(new Error('TTY not in iTerm2'));
+            resolve(stdout.trim());
         });
     });
 }
@@ -382,40 +259,9 @@ client.on('messageCreate', async (message) => {
     try {
         if (message.author.bot) return;
         if (!message.guild || message.guild.id !== config.guildId) return;
+        if (!isAuthorizedUser(message.author.id)) return;
 
-        logger.debug(`Message from ${message.author.id} in #${message.channel.name}: ${(message.content || '').substring(0, 50)}`);
-
-        if (!isAuthorizedUser(message.author.id)) {
-            logger.warn(`Unauthorized: ${message.author.id}`);
-            return;
-        }
-
-        let mapping = channelIndex.get(message.channel.id);
-
-        // If unmapped but in the Claude Sessions category, auto-recover
-        // by matching channel name to a running Claude process
-        if (!mapping && message.channel.parentId === categoryId) {
-            const channelName = message.channel.name;
-            // Try both hyphenated and underscored versions
-            const variants = [channelName, channelName.replace(/-/g, '_')];
-            for (const name of variants) {
-                const tty = findActiveTTYForProject(name);
-                const cwd = findProjectCwd(name);
-                if (tty || cwd) {
-                    channelMap[name] = {
-                        channelId: message.channel.id,
-                        tty: tty || null,
-                        lastSeen: Date.now()
-                    };
-                    rebuildChannelIndex();
-                    markChannelMapDirty();
-                    mapping = channelIndex.get(message.channel.id);
-                    logger.info(`Auto-recovered: #${channelName} → ${name} (${tty || 'CLI mode'})`);
-                    break;
-                }
-            }
-        }
-
+        const mapping = channelIndex.get(message.channel.id);
         if (!mapping) return;
 
         if (!mapping.tty) {
@@ -423,28 +269,11 @@ client.on('messageCreate', async (message) => {
             return;
         }
 
-        // Verify TTY is alive AND belongs to this project — if not, remap
-        if (!isTTYAliveForProject(mapping.tty, mapping.project)) {
-            logger.warn(`TTY ${mapping.tty} is dead for ${mapping.project}. Searching...`);
-            const newTTY = findActiveTTYForProject(mapping.project);
-            if (newTTY) {
-                channelMap[mapping.project].tty = newTTY;
-                mapping.tty = newTTY;
-                rebuildChannelIndex();
-                markChannelMapDirty();
-                logger.info(`Remapped ${mapping.project} → ${newTTY}`);
-            } else {
-                await message.reply('Terminal session not found. It may have restarted.').catch(() => {});
-                return;
-            }
-        }
-
         if (!checkAndRecordCommand(message.channel.id)) {
             await message.reply('Too fast — wait a moment.').catch(() => {});
             return;
         }
 
-        // Handle image attachments — download concurrently
         const images = message.attachments.filter(a => {
             const ext = path.extname(a.name || '').toLowerCase();
             return ALLOWED_IMAGE_EXTS.has(ext) || (a.contentType && a.contentType.startsWith('image/'));
@@ -467,50 +296,9 @@ client.on('messageCreate', async (message) => {
 
         if (!commandText) return;
 
-        try {
-            // Try iTerm2 native injection first
-            await injectToTTY(commandText, mapping.tty);
-            await message.react('✅').catch(() => {});
-            logger.info(`Injected — ${mapping.project} (${path.basename(mapping.tty)})`);
-        } catch (e) {
-            if (e.message === 'TTY not in iTerm2') {
-                // Fallback: use claude CLI --continue for non-iTerm2 sessions (VS Code, etc.)
-                await message.react('⏳').catch(() => {});
-                logger.info(`Using claude --continue for ${mapping.project} (non-iTerm2)`);
-                try {
-                    const { execFile: execFileCb } = require('child_process');
-                    // Find the project's working directory from the Claude process
-                    const projectCwd = findProjectCwd(mapping.project) || process.cwd();
-                    const response = await new Promise((resolve, reject) => {
-                        execFileCb('claude', ['-p', commandText, '--continue', '--output-format', 'text'], {
-                            cwd: projectCwd,
-                            timeout: 300000, // 5 min
-                            maxBuffer: 1024 * 1024
-                        }, (err, stdout, stderr) => {
-                            if (err) reject(err);
-                            else resolve(stdout.trim());
-                        });
-                    });
-                    // Post response directly to Discord
-                    if (response) {
-                        const chunks = response.match(/[\s\S]{1,4000}/g) || [];
-                        for (const chunk of chunks) {
-                            await message.channel.send({ embeds: [new EmbedBuilder()
-                                .setDescription(chunk)
-                                .setColor(0x2ecc71)
-                            ]}).catch(() => {});
-                        }
-                    }
-                    await message.react('✅').catch(() => {});
-                    logger.info(`CLI response sent — ${mapping.project}`);
-                } catch (cliErr) {
-                    logger.error('Claude CLI failed:', cliErr.message);
-                    await message.react('❌').catch(() => {});
-                }
-            } else {
-                throw e;
-            }
-        }
+        await injectToTTY(commandText, mapping.tty);
+        await message.react('✅').catch(() => {});
+        logger.info(`Injected — ${mapping.project} (${path.basename(mapping.tty)})`);
     } catch (e) {
         logger.error('Message handler error:', e.message);
         await message.react('❌').catch(() => {});
@@ -519,11 +307,9 @@ client.on('messageCreate', async (message) => {
 
 // ── Notification processing ──────────────────────────────
 
-// Dedup: track last notification per channel to avoid duplicate "Completed" spam
-const lastNotification = new Map(); // channelId → { message hash, timestamp }
+const lastNotification = new Map();
 
 function hashMessage(msg) {
-    // Simple hash: first 100 chars. Same content within 5s = duplicate
     return (msg || '').substring(0, 100);
 }
 
@@ -546,20 +332,12 @@ async function processNotifications() {
 
             const channel = await ensureChannel(guild, notification.project, notification.claudeTTY);
 
-            // Dedup: skip if same content sent to same channel within 5s
             const hash = hashMessage(notification.message);
             const last = lastNotification.get(channel.id);
-            if (last && last.hash === hash && Date.now() - last.time < 5000) {
-                logger.debug(`Deduped notification for #${channel.name}`);
-                continue;
-            }
+            if (last && last.hash === hash && Date.now() - last.time < 5000) continue;
             lastNotification.set(channel.id, { hash, time: Date.now() });
 
-            const emoji = notification.type === 'completed' ? '✅' : '⏳';
-            const status = notification.type === 'completed' ? 'Completed' : 'Waiting for Input';
             const fullMessage = (notification.message || '').substring(0, 4000);
-
-            // Split user question (lines starting with >) from Claude's response
             const lines = fullMessage.split('\n');
             let userQuestion = '';
             const responseLines = [];
@@ -578,6 +356,8 @@ async function processNotifications() {
             if (userQuestion) {
                 embed.setTitle(`💬 ${userQuestion.substring(0, 250)}`);
             } else {
+                const emoji = notification.type === 'completed' ? '✅' : '⏳';
+                const status = notification.type === 'completed' ? 'Completed' : 'Waiting for Input';
                 embed.setTitle(`${emoji} ${status}`);
             }
 
@@ -627,58 +407,43 @@ client.on('warn', (msg) => logger.warn('Client warning:', msg));
 client.on('shardDisconnect', (e, id) => logger.warn(`Shard ${id} disconnected (code ${e.code})`));
 client.on('shardReconnecting', (id) => logger.info(`Shard ${id} reconnecting...`));
 client.on('shardResume', async (id) => {
-    logger.info(`Shard ${id} resumed — will force full reconnect`);
+    logger.info(`Shard ${id} resumed — scheduling full reconnect`);
     needsFullReconnect = true;
-    try {
-        await client.guilds.fetch(config.guildId);
-    } catch (_) {}
 });
 client.on('shardError', (e, id) => logger.error(`Shard ${id} error:`, e.message));
 
-// Watchdog: force full reconnect after every shard resume
-// discord.js shard resume often breaks messageCreate delivery
 let watchdogRestarts = 0;
 let needsFullReconnect = false;
 
-
 async function watchdog() {
-    const ws = client.ws;
-
-    if (ws.status !== 0) {
-        logger.error(`WebSocket unhealthy (status: ${ws.status}). Force reconnect...`);
+    if (client.ws.status !== 0) {
+        logger.error(`WebSocket unhealthy (status: ${client.ws.status}). Force reconnect...`);
         await forceReconnect();
         return;
     }
-
     if (needsFullReconnect) {
         needsFullReconnect = false;
         logger.info('Executing scheduled full reconnect...');
         await forceReconnect();
-        return;
     }
 }
 
 async function forceReconnect() {
     watchdogRestarts++;
     logger.info(`Watchdog restart #${watchdogRestarts}`);
-
     try {
         client.destroy();
-        await new Promise(r => setTimeout(r, 2000)); // brief cooldown
+        await new Promise(r => setTimeout(r, 2000));
         await client.login(config.botToken);
         watchdogRestarts = 0;
         logger.info('Reconnected successfully');
     } catch (e) {
         logger.error('Reconnect failed:', e.message);
-        // If we've failed too many times in a row, exit and let the process manager restart us
         if (watchdogRestarts > 5) {
-            logger.error('Too many reconnect failures. Exiting for process manager restart.');
+            logger.error('Too many failures. Exiting.');
             process.exit(1);
         }
-        // Retry after backoff
-        const backoff = Math.min(watchdogRestarts * 5000, 30000);
-        logger.info(`Retrying in ${backoff / 1000}s...`);
-        setTimeout(() => forceReconnect(), backoff);
+        setTimeout(() => forceReconnect(), Math.min(watchdogRestarts * 5000, 30000));
     }
 }
 
