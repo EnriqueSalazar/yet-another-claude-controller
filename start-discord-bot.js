@@ -205,6 +205,31 @@ function isTTYAlive(ttyPath) {
     }
 }
 
+function findProjectCwd(projectName) {
+    try {
+        const { execFileSync } = require('child_process');
+        const psOutput = execFileSync('ps', ['-eo', 'pid,tty,comm'], {
+            encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore']
+        });
+        const claudeProcs = psOutput.split('\n')
+            .filter(l => l.includes('claude') && l.includes('ttys'))
+            .map(l => { const p = l.trim().split(/\s+/); return { pid: p[0] }; });
+
+        for (const proc of claudeProcs) {
+            try {
+                const lsof = execFileSync('lsof', ['-p', proc.pid, '-Fn'], {
+                    encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore']
+                });
+                const cwdMatch = lsof.match(/n(\/[^\n]+)/m);
+                if (cwdMatch && path.basename(cwdMatch[1]) === projectName) {
+                    return cwdMatch[1];
+                }
+            } catch (_) {}
+        }
+    } catch (_) {}
+    return null;
+}
+
 // ── iTerm2 injection ─────────────────────────────────────
 // Uses iTerm2's native `write text` — no clipboard, no keystroke simulation.
 
@@ -216,6 +241,7 @@ function injectToTTY(command, ttyPath) {
         // Escape backslashes and double quotes for AppleScript string
         const escaped = command.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
 
+        // Try iTerm2 native write first
         const script = [
             'tell application "iTerm2"',
             '    repeat with w in windows',
@@ -223,7 +249,7 @@ function injectToTTY(command, ttyPath) {
             '            repeat with s in sessions of t',
             `                if tty of s contains "${ttyName}" then`,
             `                    tell s to write text "${escaped}"`,
-            '                    return "ok"',
+            '                    return "iterm2"',
             '                end if',
             '            end repeat',
             '        end repeat',
@@ -233,9 +259,16 @@ function injectToTTY(command, ttyPath) {
         ].join('\n');
 
         execFile('osascript', ['-e', script], (error, stdout) => {
-            if (error) { reject(new Error('AppleScript failed')); return; }
-            if (stdout.trim() === 'tty_not_found') { reject(new Error('TTY not found')); return; }
-            resolve(stdout.trim());
+            const result = error ? 'tty_not_found' : stdout.trim();
+
+            if (result !== 'tty_not_found') {
+                resolve(result);
+                return;
+            }
+
+            // Fallback: TTY not in iTerm2 (VS Code, Terminal.app, etc.)
+            // Cannot inject directly — reject so caller can use claude --resume instead
+            reject(new Error('TTY not in iTerm2'));
         });
     });
 }
@@ -348,7 +381,7 @@ client.on('messageCreate', async (message) => {
             return;
         }
 
-        // Verify TTY is still alive — if not, try to find the new one
+        // Verify TTY is alive and in iTerm2 — if not, try to find the new one
         if (!isTTYAlive(mapping.tty)) {
             logger.warn(`TTY ${mapping.tty} is dead for ${mapping.project}. Searching...`);
             const newTTY = findActiveTTYForProject(mapping.project);
@@ -392,9 +425,50 @@ client.on('messageCreate', async (message) => {
 
         if (!commandText) return;
 
-        await injectToTTY(commandText, mapping.tty);
-        await message.react('✅').catch(() => {});
-        logger.info(`Injected — ${mapping.project} (${path.basename(mapping.tty)})`);
+        try {
+            // Try iTerm2 native injection first
+            await injectToTTY(commandText, mapping.tty);
+            await message.react('✅').catch(() => {});
+            logger.info(`Injected — ${mapping.project} (${path.basename(mapping.tty)})`);
+        } catch (e) {
+            if (e.message === 'TTY not in iTerm2') {
+                // Fallback: use claude CLI --continue for non-iTerm2 sessions (VS Code, etc.)
+                await message.react('⏳').catch(() => {});
+                logger.info(`Using claude --continue for ${mapping.project} (non-iTerm2)`);
+                try {
+                    const { execFile: execFileCb } = require('child_process');
+                    // Find the project's working directory from the Claude process
+                    const projectCwd = findProjectCwd(mapping.project) || process.cwd();
+                    const response = await new Promise((resolve, reject) => {
+                        execFileCb('claude', ['-p', commandText, '--continue', '--output-format', 'text'], {
+                            cwd: projectCwd,
+                            timeout: 300000, // 5 min
+                            maxBuffer: 1024 * 1024
+                        }, (err, stdout, stderr) => {
+                            if (err) reject(err);
+                            else resolve(stdout.trim());
+                        });
+                    });
+                    // Post response directly to Discord
+                    if (response) {
+                        const chunks = response.match(/[\s\S]{1,4000}/g) || [];
+                        for (const chunk of chunks) {
+                            await message.channel.send({ embeds: [new EmbedBuilder()
+                                .setDescription(chunk)
+                                .setColor(0x2ecc71)
+                            ]}).catch(() => {});
+                        }
+                    }
+                    await message.react('✅').catch(() => {});
+                    logger.info(`CLI response sent — ${mapping.project}`);
+                } catch (cliErr) {
+                    logger.error('Claude CLI failed:', cliErr.message);
+                    await message.react('❌').catch(() => {});
+                }
+            } else {
+                throw e;
+            }
+        }
     } catch (e) {
         logger.error('Message handler error:', e.message);
         await message.react('❌').catch(() => {});
