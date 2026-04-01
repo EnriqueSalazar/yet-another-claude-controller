@@ -195,14 +195,25 @@ function findActiveTTYForProject(projectName) {
     return null;
 }
 
-function isTTYAlive(ttyPath) {
+function isTTYAliveForProject(ttyPath, projectName) {
     try {
         const { execFileSync } = require('child_process');
         const ttyName = path.basename(ttyPath);
-        const psOutput = execFileSync('ps', ['-eo', 'tty,comm'], {
+        const psOutput = execFileSync('ps', ['-eo', 'pid,tty,comm'], {
             encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore']
         });
-        return psOutput.includes(ttyName) && psOutput.includes('claude');
+        // Find Claude process on this TTY
+        const proc = psOutput.split('\n').find(l => l.includes(ttyName) && l.includes('claude'));
+        if (!proc) return false;
+        // Verify this process's cwd matches the project
+        const pid = proc.trim().split(/\s+/)[0];
+        const lsof = execFileSync('lsof', ['-p', pid], {
+            encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore']
+        });
+        const cwdLine = lsof.split('\n').find(l => l.includes(' cwd '));
+        if (!cwdLine) return false;
+        const cwd = cwdLine.trim().split(/\s+/).pop();
+        return path.basename(cwd) === projectName;
     } catch (_) {
         return false;
     }
@@ -412,8 +423,8 @@ client.on('messageCreate', async (message) => {
             return;
         }
 
-        // Verify TTY is alive and in iTerm2 — if not, try to find the new one
-        if (!isTTYAlive(mapping.tty)) {
+        // Verify TTY is alive AND belongs to this project — if not, remap
+        if (!isTTYAliveForProject(mapping.tty, mapping.project)) {
             logger.warn(`TTY ${mapping.tty} is dead for ${mapping.project}. Searching...`);
             const newTTY = findActiveTTYForProject(mapping.project);
             if (newTTY) {
