@@ -125,6 +125,71 @@ function extractPrompt(output) {
 }
 
 /**
+ * Extract tool activity from the last turn of the transcript.
+ * Returns a compact summary of files edited, commands run, etc.
+ */
+function readToolActivity(transcriptPath) {
+    try {
+        const content = fs.readFileSync(transcriptPath, 'utf8');
+        const lines = content.trim().split('\n');
+
+        // Find last user message, then collect tool_use blocks after it
+        let turnStart = lines.length;
+        for (let i = lines.length - 1; i >= Math.max(0, lines.length - 50); i--) {
+            try {
+                const entry = JSON.parse(lines[i]);
+                const role = (entry.message || entry).role || entry.type;
+                if (role === 'user' || entry.type === 'human') { turnStart = i; break; }
+            } catch (_) {}
+        }
+
+        const activity = [];
+        const seenFiles = new Set();
+
+        for (let i = turnStart; i < lines.length; i++) {
+            try {
+                const entry = JSON.parse(lines[i]);
+                const msg = entry.message || entry;
+                const blocks = Array.isArray(msg.content) ? msg.content : [];
+
+                for (const block of blocks) {
+                    if (block.type !== 'tool_use') continue;
+                    const name = block.name || '';
+                    const input = block.input || {};
+
+                    if (name === 'Edit' || name === 'Write') {
+                        const fp = input.file_path || '';
+                        const short = fp.split('/').slice(-2).join('/');
+                        if (!seenFiles.has(short)) {
+                            seenFiles.add(short);
+                            activity.push(`📝 ${short}`);
+                        }
+                    } else if (name === 'Bash') {
+                        const cmd = (input.command || '').substring(0, 80);
+                        if (cmd.includes('git commit')) {
+                            const msgMatch = cmd.match(/-m\s+"([^"]+)"|--message\s+"([^"]+)"/);
+                            activity.push(`📦 commit: ${msgMatch ? (msgMatch[1] || msgMatch[2]).substring(0, 60) : 'committed'}`);
+                        } else if (cmd.includes('git push')) {
+                            activity.push('🚀 pushed');
+                        } else if (cmd.includes('npm install') || cmd.includes('npm uninstall')) {
+                            activity.push(`📦 ${cmd.substring(0, 60)}`);
+                        }
+                    } else if (name === 'Read' || name === 'Glob' || name === 'Grep') {
+                        // Skip read-only operations
+                    } else if (name) {
+                        activity.push(`🔧 ${name}`);
+                    }
+                }
+            } catch (_) {}
+        }
+
+        return activity.length > 0 ? '\n' + activity.slice(0, 8).join('\n') : '';
+    } catch (_) {
+        return '';
+    }
+}
+
+/**
  * Extract the last user question from the transcript JSONL file.
  * Returns just the question text (for the notification title).
  */
@@ -196,12 +261,18 @@ async function sendHookNotification() {
         // and use last_assistant_message as the body
         let displayMessage = lastMessage;
         let userQuestion = '';
+        let toolActivity = '';
         if (notificationType === 'completed' && transcriptPath) {
             userQuestion = readLastUserQuestion(transcriptPath);
+            toolActivity = readToolActivity(transcriptPath);
         }
         // Prepend question so the bot can extract it for the embed title
+        // Append tool activity so the bot shows what changed
         if (userQuestion) {
             displayMessage = `${userQuestion}\n${lastMessage}`;
+        }
+        if (toolActivity) {
+            displayMessage = `${displayMessage}\n${toolActivity}`;
         }
 
         // For 'waiting', read the terminal screen — but only notify if there's
