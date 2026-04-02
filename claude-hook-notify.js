@@ -93,7 +93,7 @@ function extractPrompt(output) {
     // Only look for "Do you want to proceed?" in the last 20 lines
     // to avoid matching old prompts deep in the scrollback
     let proceedLine = -1;
-    const searchStart = Math.max(0, lines.length - 20);
+    const searchStart = Math.max(0, lines.length - 40);
     for (let i = lines.length - 1; i >= searchStart; i--) {
         if (lines[i].match(/Do you want to proceed\?/)) {
             proceedLine = i;
