@@ -479,6 +479,116 @@ async function processNotifications() {
     }
 }
 
+// ── Permission prompt screen poller ──────────────────────
+// Polls iTerm2 sessions for "Do you want to proceed?" prompts
+// that the Notification hook missed.
+
+const lastPromptHash = new Map(); // channelId → hash of last prompt sent
+
+async function pollForPermissionPrompts() {
+    const { execFileSync } = require('child_process');
+
+    for (const [project, info] of Object.entries(channelMap)) {
+        if (!info.channelId || !info.tty) continue;
+        const ttyName = path.basename(info.tty);
+        if (!TTY_PATTERN.test(ttyName)) continue;
+
+        try {
+            // Read last ~40 lines from iTerm2 session
+            const script = [
+                'tell application "iTerm2"',
+                '    repeat with w in windows',
+                '        repeat with t in tabs of w',
+                '            repeat with s in sessions of t',
+                `                if tty of s contains "${ttyName}" then`,
+                '                    return text of s',
+                '                end if',
+                '            end repeat',
+                '        end repeat',
+                '    end repeat',
+                '    return ""',
+                'end tell'
+            ].join('\n');
+
+            const output = execFileSync('osascript', ['-e', script], {
+                encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000
+            }).trim();
+
+            if (!output) continue;
+
+            // Check last 40 lines for a permission prompt
+            const lines = output.split('\n');
+            const searchStart = Math.max(0, lines.length - 40);
+            let hasPrompt = false;
+            for (let i = lines.length - 1; i >= searchStart; i--) {
+                if (lines[i].includes('Do you want to proceed?')) {
+                    hasPrompt = true;
+                    break;
+                }
+            }
+
+            if (!hasPrompt) {
+                // No prompt — clear last hash so we can detect it again later
+                lastPromptHash.delete(info.channelId);
+                continue;
+            }
+
+            // Extract the prompt block
+            let promptText = '';
+            for (let i = lines.length - 1; i >= searchStart; i--) {
+                if (lines[i].includes('Do you want to proceed?')) {
+                    let blockStart = i;
+                    for (let j = i - 1; j >= Math.max(searchStart, i - 15); j--) {
+                        const line = lines[j].trim();
+                        if (line.match(/^(Bash|Read|Edit|Write|Glob|Grep|Web|Delete|Notebook)/i)) {
+                            blockStart = j;
+                            break;
+                        }
+                        if (line.match(/^[─━═]{3,}/)) {
+                            blockStart = j + 1;
+                            break;
+                        }
+                    }
+                    promptText = lines.slice(blockStart).filter(l => {
+                        const t = l.trim();
+                        if (!t) return false;
+                        if (t.match(/^(Esc to cancel|Tab to amend|ctrl\+|shift\+tab|bypass permissions|accept edits|^\d+ shell)/i)) return false;
+                        if (t.match(/^[─━═│┌┐└┘├┤┬┴┼╔╗╚╝╠╣╦╩╬\-\+\|]+$/)) return false;
+                        if (t === '›' || t === '❯' || t === '>') return false;
+                        return true;
+                    }).join('\n');
+                    break;
+                }
+            }
+
+            if (!promptText) continue;
+
+            // Dedup: hash the prompt to avoid sending the same one twice
+            const promptHash = promptText.substring(0, 200);
+            if (lastPromptHash.get(info.channelId) === promptHash) continue;
+            lastPromptHash.set(info.channelId, promptHash);
+
+            // Also check against notification dedup
+            const notifHash = hashMessage(promptText);
+            const lastNotif = lastNotification.get(info.channelId);
+            if (lastNotif && lastNotif.hash === notifHash && Date.now() - lastNotif.time < 30000) continue;
+            lastNotification.set(info.channelId, { hash: notifHash, time: Date.now() });
+
+            // Send to Discord
+            const channel = client.channels.cache.get(info.channelId);
+            if (!channel) continue;
+
+            const embed = new EmbedBuilder()
+                .setTitle('⏳ Waiting for Input')
+                .setDescription(promptText.substring(0, 4000))
+                .setColor(0xf39c12);
+
+            await channel.send({ embeds: [embed] });
+            logger.info(`Screen poller: permission prompt in #${channel.name}`);
+        } catch (_) {}
+    }
+}
+
 // ── Bot ready ────────────────────────────────────────────
 
 client.once('ready', async () => {
@@ -507,6 +617,7 @@ client.once('ready', async () => {
     setInterval(pruneRateLimits, 60 * 1000);
     setInterval(processNotifications, 2000);
     setInterval(pollChannelMessages, 5000); // REST backup every 5s
+    setInterval(pollForPermissionPrompts, 5000); // Screen backup every 5s
 });
 
 // ── Connection health ────────────────────────────────────
