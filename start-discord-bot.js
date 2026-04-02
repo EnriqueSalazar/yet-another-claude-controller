@@ -10,7 +10,7 @@ const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
 const dotenv = require('dotenv');
-const { Client, GatewayIntentBits, ChannelType, EmbedBuilder } = require('discord.js');
+const { Client, GatewayIntentBits, ChannelType, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
 const Logger = require('./src/core/logger');
 const { execFile } = require('child_process');
 
@@ -348,6 +348,40 @@ client.on('messageCreate', async (message) => {
     }
 });
 
+// ── Permission button handler ────────────────────────────
+
+client.on('interactionCreate', async (interaction) => {
+    if (!interaction.isButton()) return;
+    if (!isAuthorizedUser(interaction.user.id)) return;
+
+    const match = interaction.customId.match(/^perm:(allow|deny):(ttys\d+)$/);
+    if (!match) return;
+
+    const [, action, ttyName] = match;
+    const key = action === 'allow' ? '1' : '2';
+
+    try {
+        // Inject keystroke into the iTerm2 session
+        await injectToTTY(key, `/dev/${ttyName}`);
+
+        // Update the message to show the outcome
+        const label = action === 'allow' ? '✅ Allowed' : '❌ Denied';
+        await interaction.update({
+            components: [], // Remove buttons
+            embeds: [
+                EmbedBuilder.from(interaction.message.embeds[0])
+                    .setFooter({ text: label })
+                    .setColor(action === 'allow' ? 0x2ecc71 : 0xe74c3c)
+            ]
+        }).catch(() => {});
+
+        logger.info(`Permission ${action} via button → ${ttyName}`);
+    } catch (e) {
+        logger.error('Permission button error:', e.message);
+        await interaction.reply({ content: 'Failed to send response.', ephemeral: true }).catch(() => {});
+    }
+});
+
 // ── REST message poller (backup) ─────────────────────────
 // Polls session channels via REST API to catch messages the gateway missed
 
@@ -470,7 +504,29 @@ async function processNotifications() {
 
             if (description) embed.setDescription(description);
 
-            await channel.send({ embeds: [embed] });
+            // Add Allow/Deny buttons for permission prompts
+            const isPermission = notification.type === 'waiting' &&
+                (notification.message || '').includes('Do you want to proceed?');
+            const messageOptions = { embeds: [embed] };
+
+            if (isPermission && notification.claudeTTY) {
+                const ttyName = path.basename(notification.claudeTTY);
+                const row = new ActionRowBuilder().addComponents(
+                    new ButtonBuilder()
+                        .setCustomId(`perm:allow:${ttyName}`)
+                        .setLabel('Allow')
+                        .setEmoji('✅')
+                        .setStyle(ButtonStyle.Success),
+                    new ButtonBuilder()
+                        .setCustomId(`perm:deny:${ttyName}`)
+                        .setLabel('Deny')
+                        .setEmoji('❌')
+                        .setStyle(ButtonStyle.Danger)
+                );
+                messageOptions.components = [row];
+            }
+
+            await channel.send(messageOptions);
             logger.info(`Notification → #${channel.name}`);
         } catch (e) {
             logger.error('Notification failed:', e.message);
@@ -583,7 +639,20 @@ async function pollForPermissionPrompts() {
                 .setDescription(promptText.substring(0, 4000))
                 .setColor(0xf39c12);
 
-            await channel.send({ embeds: [embed] });
+            const row = new ActionRowBuilder().addComponents(
+                new ButtonBuilder()
+                    .setCustomId(`perm:allow:${ttyName}`)
+                    .setLabel('Allow')
+                    .setEmoji('✅')
+                    .setStyle(ButtonStyle.Success),
+                new ButtonBuilder()
+                    .setCustomId(`perm:deny:${ttyName}`)
+                    .setLabel('Deny')
+                    .setEmoji('❌')
+                    .setStyle(ButtonStyle.Danger)
+            );
+
+            await channel.send({ embeds: [embed], components: [row] });
             logger.info(`Screen poller: permission prompt in #${channel.name}`);
         } catch (_) {}
     }
