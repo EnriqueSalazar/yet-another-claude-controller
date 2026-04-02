@@ -223,7 +223,7 @@ function readLastUserQuestion(transcriptPath) {
 async function sendHookNotification() {
     try {
         const notificationType = process.argv[2] || 'completed';
-        if (!['completed', 'waiting'].includes(notificationType)) process.exit(1);
+        if (!['completed', 'waiting', 'permission'].includes(notificationType)) process.exit(1);
 
         const hookData = await readStdin();
         const lastMessage = hookData.last_assistant_message || '';
@@ -256,6 +256,30 @@ async function sendHookNotification() {
         // Only notify for interactive terminal sessions
         if (!claudeTTY) return;
         if (!/^\/dev\/ttys\d+$/.test(claudeTTY)) return;
+
+        // For 'permission', build a structured prompt from hook data
+        if (notificationType === 'permission') {
+            const toolName = hookData.tool_name || 'Unknown tool';
+            const toolInput = hookData.tool_input || {};
+            const inputPreview = typeof toolInput === 'string'
+                ? toolInput.substring(0, 300)
+                : JSON.stringify(toolInput).substring(0, 300);
+
+            const promptText = `**${toolName}**\n\`\`\`\n${inputPreview}\n\`\`\`\nDo you want to proceed?\n› 1. Yes\n  2. No`;
+
+            const notification = {
+                type: 'waiting',
+                project: projectName,
+                claudeTTY: claudeTTY,
+                message: promptText,
+                timestamp: Date.now()
+            };
+
+            const filename = `${Date.now()}_${crypto.randomBytes(4).toString('hex')}.json`;
+            const fp = path.join(NOTIFY_DIR, filename);
+            fs.writeFileSync(fp, JSON.stringify(notification), { mode: 0o600 });
+            return;
+        }
 
         // For 'completed', extract the user question from transcript (for title)
         // and use last_assistant_message as the body
