@@ -140,13 +140,38 @@ function injectToTTY(command, ttyPath) {
 
         const escaped = command.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
 
+        // Use two methods:
+        // 1. write text — for regular commands (fast, reliable)
+        // 2. keystroke simulation — for short inputs like permission prompt answers
+        //    (write text doesn't work for TUI dialogs)
+        const isShortInput = command.length <= 5 && /^[0-9a-zA-Z\s]+$/.test(command);
+
+        let action;
+        if (isShortInput) {
+            // Keystroke simulation: select the session's tab, bring to front, type keys
+            action = [
+                `                    select t`,
+                `                    select s`,
+                `                    set index of w to 1`,
+                `                    tell application "iTerm2" to activate`,
+                `                    delay 0.3`,
+                `                    tell application "System Events"`,
+                `                        keystroke "${escaped}"`,
+                `                        delay 0.1`,
+                `                        keystroke return`,
+                `                    end tell`,
+            ].join('\n');
+        } else {
+            action = `                    tell s to write text "${escaped}"`;
+        }
+
         const script = [
             'tell application "iTerm2"',
             '    repeat with w in windows',
             '        repeat with t in tabs of w',
             '            repeat with s in sessions of t',
             `                if tty of s contains "${ttyName}" then`,
-            `                    tell s to write text "${escaped}"`,
+            action,
             '                    return "ok"',
             '                end if',
             '            end repeat',
