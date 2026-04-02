@@ -332,10 +332,23 @@ async function pollChannelMessages() {
     for (const [project, info] of Object.entries(channelMap)) {
         if (!info.channelId || !info.tty) continue;
         try {
-            const channel = client.channels.cache.get(info.channelId);
+            // Fetch channel — may not be in cache after reconnect
+            let channel = client.channels.cache.get(info.channelId);
+            if (!channel) {
+                try { channel = await client.channels.fetch(info.channelId); } catch (_) { continue; }
+            }
             if (!channel) continue;
 
-            const after = lastPolledMessage.get(info.channelId) || '0';
+            // If we haven't polled this channel before, initialize to latest message
+            if (!lastPolledMessage.has(info.channelId)) {
+                const latest = await channel.messages.fetch({ limit: 1 }).catch(() => null);
+                if (latest && latest.size > 0) {
+                    lastPolledMessage.set(info.channelId, latest.first().id);
+                }
+                continue; // Skip this cycle — don't replay history
+            }
+
+            const after = lastPolledMessage.get(info.channelId);
             const messages = await channel.messages.fetch({ limit: 10, after }).catch(() => null);
             if (!messages || messages.size === 0) continue;
 
